@@ -2,6 +2,8 @@ import os
 import re
 import math
 import asyncio
+import hashlib
+import random
 import requests
 from telethon import TelegramClient
 from telethon.tl.functions.upload import SaveBigFilePartRequest
@@ -11,7 +13,6 @@ from telethon.tl.types import (
     InputMediaUploadedDocument,
     DocumentAttributeFilename,
 )
-import random
 
 # ====== YOUR API DETAILS ======
 api_id   = 38963550
@@ -19,119 +20,39 @@ api_hash = "1e7e73506dd3e91f2c513240e701945d"
 phone    = "+94704608828"
 # ==============================
 
-PART_SIZE   = 1990 * 1024 * 1024   # 1990 MB
-UPLOAD_CHUNK = 512 * 1024           # 512 KB
+PART_SIZE    = 1990 * 1024 * 1024
+UPLOAD_CHUNK = 512 * 1024
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
-
-# ═══════════════════════════════════════════
-#  SOURCE DETECTION
-# ═══════════════════════════════════════════
-def detect_source(url: str) -> str:
-    """URL eka balala source eka detect karanawa."""
-    if "gofile.io" in url:
-        return "gofile"
-    if "drive.google.com" in url or "docs.google.com" in url:
-        return "gdrive"
-    raise ValueError("Supported sources: GoFile (gofile.io) | Google Drive (drive.google.com)")
+MAX_RETRIES  = 5      # download retry count
+CHUNK_SIZE   = 4 * 1024 * 1024   # 4MB download chunks
 
 
 # ═══════════════════════════════════════════
-#  GOOGLE DRIVE SUPPORT
+#  MD5 CHECKSUM
 # ═══════════════════════════════════════════
-def extract_gdrive_file_id(url: str) -> str:
-    """Google Drive URL ekata file ID extract karanawa."""
-    # Format: /file/d/FILE_ID/view  or  ?id=FILE_ID
-    patterns = [
-        r"/file/d/([a-zA-Z0-9_-]{10,})",
-        r"id=([a-zA-Z0-9_-]{10,})",
-        r"/d/([a-zA-Z0-9_-]{10,})",
-    ]
-    for pat in patterns:
-        m = re.search(pat, url)
-        if m:
-            return m.group(1)
-    raise ValueError(f"Google Drive file ID extract karannat bari: {url}")
+def md5_file(path: str) -> str:
+    """File ekage MD5 hash calculate karanawa."""
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(8 * 1024 * 1024)  # 8MB씩
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
 
 
-def get_gdrive_direct_link(page_url: str):
-    """
-    Google Drive direct download link + filename + size return karanawa.
-    gdown library use karanawa (pip install gdown).
-    """
-    try:
-        import gdown
-    except ImportError:
-        raise ImportError(
-            "gdown install karanna: pip install gdown"
-        )
-
-    file_id = extract_gdrive_file_id(page_url)
-    print(f"[*] Google Drive File ID: {file_id}")
-
-    # Metadata fetch
-    meta_url = f"https://drive.google.com/uc?id={file_id}&export=download"
-
-    session = requests.Session()
-    session.headers.update({"User-Agent": UA})
-
-    resp = session.get(meta_url, allow_redirects=False, timeout=15)
-
-    # Filename extract from headers
-    fname = None
-    if "Content-Disposition" in resp.headers:
-        cd = resp.headers["Content-Disposition"]
-        m = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';\n]+)', cd)
-        if m:
-            fname = m.group(1).strip()
-
-    # Large file — virus scan warning bypass
-    if resp.status_code == 302 or "accounts.google.com" not in resp.headers.get("location", ""):
-        # Use gdown to get real URL (handles confirm token)
-        direct_url = f"https://drive.google.com/uc?id={file_id}&export=download&confirm=t"
-    else:
-        direct_url = meta_url
-
-    # Try to get size
-    head = session.head(direct_url, allow_redirects=True, timeout=15)
-    size = int(head.headers.get("content-length", 0))
-
-    if not fname:
-        # Try from URL or default
-        cd = head.headers.get("Content-Disposition", "")
-        m = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';\n]+)', cd)
-        fname = m.group(1).strip() if m else f"gdrive_{file_id}"
-
-    # URL decode filename
-    from urllib.parse import unquote
-    fname = unquote(fname)
-
-    print(f"[*] File  : {fname}")
-    print(f"[*] Size  : {size // (1024**2)} MB" if size else "[*] Size  : Unknown")
-
-    return direct_url, fname, file_id, session
-
-
-def download_gdrive_file(file_id: str, filename: str):
-    """gdown use karala Google Drive file download karanawa."""
-    try:
-        import gdown
-    except ImportError:
-        raise ImportError("pip install gdown")
-
-    print(f"\n[↓] Google Drive ekata download karanawa: {filename}")
-    url = f"https://drive.google.com/uc?id={file_id}"
-    gdown.download(url, filename, quiet=False, fuzzy=True)
-
-    if not os.path.exists(filename) or os.path.getsize(filename) == 0:
-        raise Exception("Download fail — file empty or missing.")
-
-    size = os.path.getsize(filename)
-    print(f"[✓] Download complete: {size // (1024**2)} MB")
+def md5_stream(data: bytes, existing_md5=None):
+    """Streaming download waladi chunk ekak씩 hash update karanawa."""
+    if existing_md5 is None:
+        return hashlib.md5(data)
+    existing_md5.update(data)
+    return existing_md5
 
 
 # ═══════════════════════════════════════════
-#  GOFILE SUPPORT  (original code — unchanged)
+#  GOFILE
 # ═══════════════════════════════════════════
 def get_website_token() -> str:
     try:
@@ -153,10 +74,9 @@ def get_website_token() -> str:
         ]:
             m = re.search(pat, js)
             if m:
-                print(f"[*] WebsiteToken (regex): {m.group(1)}")
                 return m.group(1)
 
-        raise Exception(f"Token pattern nemata. config.js:\n{js[:400]}")
+        raise Exception(f"Token nemata:\n{js[:400]}")
     except Exception as e:
         raise Exception(f"config.js fail: {e}")
 
@@ -175,15 +95,14 @@ def get_gofile_direct_link(page_url: str):
     if r.get("status") != "ok":
         raise Exception(f"Guest token fail: {r}")
     guest_token = r["data"]["token"]
-    print("[*] Guest token : OK")
 
     wt = get_website_token()
-
     headers = {
         "Authorization": f"Bearer {guest_token}",
         "X-Website-Token": wt,
         "User-Agent": UA,
     }
+
     resp = requests.get(
         f"https://api.gofile.io/contents/{content_id}?cache=true",
         headers=headers, timeout=30
@@ -196,43 +115,135 @@ def get_gofile_direct_link(page_url: str):
             "error-notFound"  : "Content ID invalid.",
             "error-passwordRequired": "Password protected.",
         }
-        raise Exception(f"GoFile error: {err}\n{tips.get(err, err)}")
+        raise Exception(f"GoFile error: {err} — {tips.get(err, '')}")
 
-    data = resp["data"]
+    data     = resp["data"]
     children = data.get("children", {})
     file_item = next((v for v in children.values() if v.get("type") == "file"), None)
     if not file_item:
-        if data.get("type") == "file":
-            file_item = data
-        else:
-            raise Exception("File nemata.")
+        file_item = data if data.get("type") == "file" else None
+    if not file_item:
+        raise Exception("File nemata.")
 
-    name = file_item["name"]
-    url  = file_item["link"]
-    size = file_item.get("size", 0)
+    name     = file_item["name"]
+    url      = file_item["link"]
+    size     = file_item.get("size", 0)
+    md5      = file_item.get("md5", None)   # GoFile sometimes provides MD5
+
     print(f"[*] File  : {name}")
     print(f"[*] Size  : {size // (1024**2)} MB")
-    return url, name, headers
+    if md5:
+        print(f"[*] MD5   : {md5}  (server provided)")
+
+    return url, name, headers, md5
 
 
-def download_gofile(url: str, filename: str, headers: dict):
-    print(f"\n[↓] GoFile ekata download karanawa: {filename}")
-    with requests.get(url, headers=headers, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        total = int(r.headers.get("content-length", 0))
-        done  = 0
-        with open(filename, "wb") as f:
-            for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-                    done += len(chunk)
-                    if total:
-                        print(
-                            f"\r    {done/total*100:5.1f}%  "
-                            f"{done//(1024**2)}MB / {total//(1024**2)}MB",
-                            end="", flush=True
-                        )
-    print(f"\n[✓] Download complete: {done//(1024**2)} MB")
+# ═══════════════════════════════════════════
+#  ROBUST DOWNLOADER — retry + verify
+# ═══════════════════════════════════════════
+def download_file(url: str, filename: str, headers: dict, expected_md5: str = None):
+    """
+    Corruption-free downloader:
+    - Resume support (Range header)
+    - Per-chunk write + immediate flush
+    - MD5 verify after complete download
+    - Auto retry on failure (MAX_RETRIES times)
+    """
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            print(f"\n[↓] Download attempt {attempt}/{MAX_RETRIES}: {filename}")
+
+            # Resume support — already downloaded bytes check
+            downloaded = 0
+            if os.path.exists(filename):
+                downloaded = os.path.getsize(filename)
+                if downloaded > 0:
+                    print(f"    Resuming from {downloaded // (1024**2)} MB...")
+
+            req_headers = dict(headers)
+            if downloaded > 0:
+                req_headers["Range"] = f"bytes={downloaded}-"
+
+            with requests.get(url, headers=req_headers, stream=True, timeout=60) as r:
+                if r.status_code == 416:
+                    # Already fully downloaded
+                    print("    Already fully downloaded.")
+                    break
+
+                r.raise_for_status()
+
+                total = int(r.headers.get("content-length", 0)) + downloaded
+                mode  = "ab" if downloaded > 0 else "wb"
+
+                hasher = hashlib.md5()
+
+                # Hash existing data if resuming
+                if downloaded > 0 and os.path.exists(filename):
+                    print("    Hashing existing data...")
+                    with open(filename, "rb") as existing:
+                        while True:
+                            c = existing.read(8 * 1024 * 1024)
+                            if not c:
+                                break
+                            hasher.update(c)
+
+                done = downloaded
+                with open(filename, mode) as f:
+                    for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        f.flush()               # OS buffer flush
+                        os.fsync(f.fileno())    # Disk write guarantee
+                        hasher.update(chunk)
+                        done += len(chunk)
+
+                        if total:
+                            pct = done / total * 100
+                            print(
+                                f"\r    {pct:5.1f}%  {done//(1024**2)}MB / {total//(1024**2)}MB",
+                                end="", flush=True
+                            )
+
+            print(f"\n[✓] Download complete: {done//(1024**2)} MB")
+
+            # ── Size verify ──
+            actual_size = os.path.getsize(filename)
+            if total and actual_size != total:
+                raise Exception(
+                    f"Size mismatch! Expected {total} bytes, got {actual_size} bytes."
+                )
+
+            # ── MD5 verify ──
+            local_md5 = hasher.hexdigest()
+            print(f"[*] Local MD5  : {local_md5}")
+
+            if expected_md5:
+                if local_md5.lower() == expected_md5.lower():
+                    print("[✓] MD5 match — file intact!")
+                else:
+                    raise Exception(
+                        f"MD5 MISMATCH! File corrupted!\n"
+                        f"  Expected : {expected_md5}\n"
+                        f"  Got      : {local_md5}"
+                    )
+            else:
+                print("[*] Server MD5 nemata — size verify only.")
+
+            return local_md5   # Success
+
+        except Exception as e:
+            print(f"\n[!] Attempt {attempt} failed: {e}")
+            if attempt < MAX_RETRIES:
+                wait = 5 * attempt
+                print(f"    {wait}s wait karala retry karanawa...")
+                import time; time.sleep(wait)
+                # Corrupt partial file delete and restart
+                if os.path.exists(filename) and "MD5 MISMATCH" in str(e):
+                    os.remove(filename)
+                    print("    Corrupted file deleted, restarting download...")
+            else:
+                raise Exception(f"Download failed after {MAX_RETRIES} attempts: {e}")
 
 
 # ═══════════════════════════════════════════
@@ -245,10 +256,15 @@ def split_file(path: str) -> list:
     print(f"[*] Parts     : {n} x ~{PART_SIZE//(1024**2)} MB")
 
     if n == 1:
-        print("[*] Split karanna oni naha — file already 2GB walata yatata.")
+        print("[*] Split karanna oni naha.")
         return [path]
 
     parts = []
+    # Original file MD5
+    print("[*] Original file MD5 calculating...")
+    orig_md5 = md5_file(path)
+    print(f"[*] Original MD5: {orig_md5}")
+
     with open(path, "rb") as f:
         for i in range(n):
             pname = f"{path}.part{i+1}of{n}"
@@ -266,8 +282,17 @@ def split_file(path: str) -> list:
                 os.remove(pname)
                 continue
 
-            print(f"[✓] Part {i+1}: {actual//(1024**2)} MB → {pname}")
+            part_md5 = md5_file(pname)
+            print(f"[✓] Part {i+1}: {actual//(1024**2)} MB | MD5: {part_md5}")
             parts.append(pname)
+
+    # Save MD5 manifest
+    manifest_path = f"{path}.md5"
+    with open(manifest_path, "w") as mf:
+        mf.write(f"original={orig_md5}\n")
+        for p in parts:
+            mf.write(f"{os.path.basename(p)}={md5_file(p)}\n")
+    print(f"[*] MD5 manifest saved: {manifest_path}")
 
     return parts
 
@@ -315,9 +340,16 @@ async def upload_to_telegram(parts: list, original_name: str):
         for i, p in enumerate(parts, 1):
             fname   = os.path.basename(p)
             size_mb = os.path.getsize(p) // (1024 ** 2)
-            caption = f"📦 {original_name}\n🗂 Part {i}/{total}"
+            part_md5 = md5_file(p)
+            caption = (
+                f"📦 {original_name}\n"
+                f"🗂 Part {i}/{total}\n"
+                f"🔑 MD5: {part_md5}"
+            )
 
             print(f"\n[↑] Uploading: {fname}  ({size_mb} MB)  [{i}/{total}]")
+            print(f"    MD5: {part_md5}")
+
             input_file = await upload_large_file(client, p)
 
             await client(SendMediaRequest(
@@ -340,42 +372,28 @@ async def upload_to_telegram(parts: list, original_name: str):
 # ═══════════════════════════════════════════
 async def main():
     print("=" * 55)
-    print("  GoFile / Google Drive → Telegram Uploader")
+    print("  GoFile → Telegram Uploader  [Corruption-Free]")
     print("=" * 55)
-    print("\nSupported links:")
-    print("  • GoFile      : https://gofile.io/d/XXXXX")
-    print("  • Google Drive: https://drive.google.com/file/d/XXXXX/view")
 
-    url    = input("\nLink paste karanna: ").strip()
-    source = detect_source(url)
+    url = input("\nGoFile link (https://gofile.io/d/XXXXX): ").strip()
 
-    fname = None
-    try:
-        if source == "gofile":
-            print("\n[*] Source: GoFile")
-            dl_url, fname, hdrs = get_gofile_direct_link(url)
-            download_gofile(dl_url, fname, hdrs)
+    dl_url, fname, hdrs, server_md5 = get_gofile_direct_link(url)
+    download_file(dl_url, fname, hdrs, expected_md5=server_md5)
+    parts = split_file(fname)
+    await upload_to_telegram(parts, fname)
 
-        elif source == "gdrive":
-            print("\n[*] Source: Google Drive")
-            _dl_url, fname, file_id, _session = get_gdrive_direct_link(url)
-            download_gdrive_file(file_id, fname)
-
-        parts = split_file(fname)
-        await upload_to_telegram(parts, fname)
-
-        if input("\nLocal files delete karanna? (y/n): ").strip().lower() == "y":
-            targets = set(parts)
-            if fname and fname not in parts:
-                targets.add(fname)
-            for f in targets:
-                if os.path.exists(f):
-                    os.remove(f)
-                    print(f"[✓] Deleted: {f}")
-
-    except Exception as e:
-        print(f"\n[✗] Error: {e}")
-        raise
+    if input("\nLocal files delete? (y/n): ").strip().lower() == "y":
+        targets = set(parts)
+        if fname not in parts:
+            targets.add(fname)
+        # Also delete manifest
+        manifest = f"{fname}.md5"
+        if os.path.exists(manifest):
+            targets.add(manifest)
+        for f in targets:
+            if os.path.exists(f):
+                os.remove(f)
+                print(f"[✓] Deleted: {f}")
 
     print("\n🎉 Done!")
 
