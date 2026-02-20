@@ -4,6 +4,7 @@ import math
 import asyncio
 import hashlib
 import random
+import subprocess
 import requests
 from telethon import TelegramClient
 from telethon.tl.functions.upload import SaveBigFilePartRequest
@@ -24,35 +25,134 @@ PART_SIZE    = 1990 * 1024 * 1024
 UPLOAD_CHUNK = 512 * 1024
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
-MAX_RETRIES  = 5      # download retry count
-CHUNK_SIZE   = 4 * 1024 * 1024   # 4MB download chunks
+MAX_RETRIES  = 5
+CHUNK_SIZE   = 4 * 1024 * 1024
 
 
 # ═══════════════════════════════════════════
 #  MD5 CHECKSUM
 # ═══════════════════════════════════════════
 def md5_file(path: str) -> str:
-    """File ekage MD5 hash calculate karanawa."""
     h = hashlib.md5()
     with open(path, "rb") as f:
         while True:
-            chunk = f.read(8 * 1024 * 1024)  # 8MB씩
+            chunk = f.read(8 * 1024 * 1024)
             if not chunk:
                 break
             h.update(chunk)
     return h.hexdigest()
 
 
-def md5_stream(data: bytes, existing_md5=None):
-    """Streaming download waladi chunk ekak씩 hash update karanawa."""
-    if existing_md5 is None:
-        return hashlib.md5(data)
-    existing_md5.update(data)
-    return existing_md5
+# ═══════════════════════════════════════════
+#  YOUTUBE DOWNLOADER (yt-dlp)
+# ═══════════════════════════════════════════
+def check_ytdlp():
+    """yt-dlp install wela thiyanawada check karanawa"""
+    try:
+        subprocess.run(["yt-dlp", "--version"], capture_output=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("[!] yt-dlp nemata. Install karanawa...")
+        subprocess.run(["pip", "install", "-U", "yt-dlp"], check=True)
+        return True
+
+
+def get_youtube_formats(url: str):
+    """Available formats list karanawa"""
+    result = subprocess.run(
+        ["yt-dlp", "-F", url],
+        capture_output=True, text=True
+    )
+    print(result.stdout)
+
+
+def download_youtube(url: str, quality: str = "best") -> str:
+    """
+    YouTube video full quality download karanawa.
+    quality options:
+        "best"   - Best video + audio (merged)
+        "4k"     - 2160p
+        "1080p"  - 1080p
+        "720p"   - 720p
+        "audio"  - Audio only (mp3)
+    """
+    check_ytdlp()
+
+    # Format selection
+    format_map = {
+        "best" : "bestvideo+bestaudio/best",
+        "4k"   : "bestvideo[height<=2160]+bestaudio/best[height<=2160]",
+        "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+        "720p" : "bestvideo[height<=720]+bestaudio/best[height<=720]",
+        "audio": "bestaudio/best",
+    }
+
+    fmt = format_map.get(quality, "bestvideo+bestaudio/best")
+
+    # Output filename
+    output_template = "%(title)s.%(ext)s"
+
+    cmd = [
+        "yt-dlp",
+        "-f", fmt,
+        "--merge-output-format", "mp4",   # Always mp4 output
+        "--output", output_template,
+        "--progress",
+        "--no-playlist",                   # Single video only (playlist disable)
+        "--cookies-from-browser", "chrome",  # YouTube age restrict bypass
+        url
+    ]
+
+    # Audio only nam mp3 convert
+    if quality == "audio":
+        cmd = [
+            "yt-dlp",
+            "-f", "bestaudio/best",
+            "--extract-audio",
+            "--audio-format", "mp3",
+            "--audio-quality", "0",
+            "--output", output_template,
+            "--progress",
+            url
+        ]
+
+    print(f"\n[*] Quality: {quality}")
+    print(f"[*] Format : {fmt}")
+    print(f"[↓] Downloading YouTube video...\n")
+
+    # Get video title first (filename find karanata)
+    title_result = subprocess.run(
+        ["yt-dlp", "--get-filename", "-o", output_template, "-f", fmt,
+         "--merge-output-format", "mp4", url],
+        capture_output=True, text=True
+    )
+    expected_filename = title_result.stdout.strip()
+    print(f"[*] Expected file: {expected_filename}")
+
+    # Download
+    result = subprocess.run(cmd)
+
+    if result.returncode != 0:
+        raise Exception("YouTube download failed! URL check karanawa.")
+
+    # Find downloaded file
+    if os.path.exists(expected_filename):
+        actual_size = os.path.getsize(expected_filename)
+        print(f"\n[✓] Download complete: {expected_filename}")
+        print(f"[*] Size: {actual_size // (1024**2)} MB")
+        return expected_filename
+    else:
+        # Search for recently created mp4 file
+        files = [f for f in os.listdir(".") if f.endswith((".mp4", ".mkv", ".mp3", ".webm"))]
+        if files:
+            latest = max(files, key=os.path.getmtime)
+            print(f"[✓] Found: {latest}")
+            return latest
+        raise Exception("Downloaded file nemata!")
 
 
 # ═══════════════════════════════════════════
-#  GOFILE
+#  GOFILE DOWNLOADER (original)
 # ═══════════════════════════════════════════
 def get_website_token() -> str:
     try:
@@ -128,7 +228,7 @@ def get_gofile_direct_link(page_url: str):
     name     = file_item["name"]
     url      = file_item["link"]
     size     = file_item.get("size", 0)
-    md5      = file_item.get("md5", None)   # GoFile sometimes provides MD5
+    md5      = file_item.get("md5", None)
 
     print(f"[*] File  : {name}")
     print(f"[*] Size  : {size // (1024**2)} MB")
@@ -138,22 +238,11 @@ def get_gofile_direct_link(page_url: str):
     return url, name, headers, md5
 
 
-# ═══════════════════════════════════════════
-#  ROBUST DOWNLOADER — retry + verify
-# ═══════════════════════════════════════════
 def download_file(url: str, filename: str, headers: dict, expected_md5: str = None):
-    """
-    Corruption-free downloader:
-    - Resume support (Range header)
-    - Per-chunk write + immediate flush
-    - MD5 verify after complete download
-    - Auto retry on failure (MAX_RETRIES times)
-    """
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             print(f"\n[↓] Download attempt {attempt}/{MAX_RETRIES}: {filename}")
 
-            # Resume support — already downloaded bytes check
             downloaded = 0
             if os.path.exists(filename):
                 downloaded = os.path.getsize(filename)
@@ -166,7 +255,6 @@ def download_file(url: str, filename: str, headers: dict, expected_md5: str = No
 
             with requests.get(url, headers=req_headers, stream=True, timeout=60) as r:
                 if r.status_code == 416:
-                    # Already fully downloaded
                     print("    Already fully downloaded.")
                     break
 
@@ -174,10 +262,8 @@ def download_file(url: str, filename: str, headers: dict, expected_md5: str = No
 
                 total = int(r.headers.get("content-length", 0)) + downloaded
                 mode  = "ab" if downloaded > 0 else "wb"
-
                 hasher = hashlib.md5()
 
-                # Hash existing data if resuming
                 if downloaded > 0 and os.path.exists(filename):
                     print("    Hashing existing data...")
                     with open(filename, "rb") as existing:
@@ -193,8 +279,8 @@ def download_file(url: str, filename: str, headers: dict, expected_md5: str = No
                         if not chunk:
                             continue
                         f.write(chunk)
-                        f.flush()               # OS buffer flush
-                        os.fsync(f.fileno())    # Disk write guarantee
+                        f.flush()
+                        os.fsync(f.fileno())
                         hasher.update(chunk)
                         done += len(chunk)
 
@@ -207,14 +293,10 @@ def download_file(url: str, filename: str, headers: dict, expected_md5: str = No
 
             print(f"\n[✓] Download complete: {done//(1024**2)} MB")
 
-            # ── Size verify ──
             actual_size = os.path.getsize(filename)
             if total and actual_size != total:
-                raise Exception(
-                    f"Size mismatch! Expected {total} bytes, got {actual_size} bytes."
-                )
+                raise Exception(f"Size mismatch! Expected {total} bytes, got {actual_size} bytes.")
 
-            # ── MD5 verify ──
             local_md5 = hasher.hexdigest()
             print(f"[*] Local MD5  : {local_md5}")
 
@@ -223,14 +305,12 @@ def download_file(url: str, filename: str, headers: dict, expected_md5: str = No
                     print("[✓] MD5 match — file intact!")
                 else:
                     raise Exception(
-                        f"MD5 MISMATCH! File corrupted!\n"
-                        f"  Expected : {expected_md5}\n"
-                        f"  Got      : {local_md5}"
+                        f"MD5 MISMATCH!\n  Expected : {expected_md5}\n  Got      : {local_md5}"
                     )
             else:
                 print("[*] Server MD5 nemata — size verify only.")
 
-            return local_md5   # Success
+            return local_md5
 
         except Exception as e:
             print(f"\n[!] Attempt {attempt} failed: {e}")
@@ -238,10 +318,8 @@ def download_file(url: str, filename: str, headers: dict, expected_md5: str = No
                 wait = 5 * attempt
                 print(f"    {wait}s wait karala retry karanawa...")
                 import time; time.sleep(wait)
-                # Corrupt partial file delete and restart
                 if os.path.exists(filename) and "MD5 MISMATCH" in str(e):
                     os.remove(filename)
-                    print("    Corrupted file deleted, restarting download...")
             else:
                 raise Exception(f"Download failed after {MAX_RETRIES} attempts: {e}")
 
@@ -260,7 +338,6 @@ def split_file(path: str) -> list:
         return [path]
 
     parts = []
-    # Original file MD5
     print("[*] Original file MD5 calculating...")
     orig_md5 = md5_file(path)
     print(f"[*] Original MD5: {orig_md5}")
@@ -286,7 +363,6 @@ def split_file(path: str) -> list:
             print(f"[✓] Part {i+1}: {actual//(1024**2)} MB | MD5: {part_md5}")
             parts.append(pname)
 
-    # Save MD5 manifest
     manifest_path = f"{path}.md5"
     with open(manifest_path, "w") as mf:
         mf.write(f"original={orig_md5}\n")
@@ -338,10 +414,10 @@ async def upload_to_telegram(parts: list, original_name: str):
 
         total = len(parts)
         for i, p in enumerate(parts, 1):
-            fname   = os.path.basename(p)
-            size_mb = os.path.getsize(p) // (1024 ** 2)
+            fname    = os.path.basename(p)
+            size_mb  = os.path.getsize(p) // (1024 ** 2)
             part_md5 = md5_file(p)
-            caption = (
+            caption  = (
                 f"📦 {original_name}\n"
                 f"🗂 Part {i}/{total}\n"
                 f"🔑 MD5: {part_md5}"
@@ -372,13 +448,37 @@ async def upload_to_telegram(parts: list, original_name: str):
 # ═══════════════════════════════════════════
 async def main():
     print("=" * 55)
-    print("  GoFile → Telegram Uploader  [Corruption-Free]")
+    print("  GoFile / YouTube → Telegram Uploader")
     print("=" * 55)
 
-    url = input("\nGoFile link (https://gofile.io/d/XXXXX): ").strip()
+    print("\nSource type select karanawa:")
+    print("  1. GoFile  (https://gofile.io/d/XXXXX)")
+    print("  2. YouTube (https://youtube.com/watch?v=XXXXX)")
+    choice = input("Choice (1 or 2): ").strip()
 
-    dl_url, fname, hdrs, server_md5 = get_gofile_direct_link(url)
-    download_file(dl_url, fname, hdrs, expected_md5=server_md5)
+    if choice == "2":
+        # YouTube mode
+        url = input("YouTube URL: ").strip()
+
+        print("\nQuality select karanawa:")
+        print("  1. Best (highest available)")
+        print("  2. 4K  (2160p)")
+        print("  3. 1080p")
+        print("  4. 720p")
+        print("  5. Audio only (MP3)")
+        q_choice = input("Choice (1-5): ").strip()
+
+        quality_map = {"1": "best", "2": "4k", "3": "1080p", "4": "720p", "5": "audio"}
+        quality = quality_map.get(q_choice, "best")
+
+        fname = download_youtube(url, quality)
+
+    else:
+        # GoFile mode
+        url = input("\nGoFile link (https://gofile.io/d/XXXXX): ").strip()
+        dl_url, fname, hdrs, server_md5 = get_gofile_direct_link(url)
+        download_file(dl_url, fname, hdrs, expected_md5=server_md5)
+
     parts = split_file(fname)
     await upload_to_telegram(parts, fname)
 
@@ -386,7 +486,6 @@ async def main():
         targets = set(parts)
         if fname not in parts:
             targets.add(fname)
-        # Also delete manifest
         manifest = f"{fname}.md5"
         if os.path.exists(manifest):
             targets.add(manifest)
